@@ -1,13 +1,13 @@
 {
   "name": "claude-limits",
-  "displayName": "Claude & Codex Limits",
-  "description": "Monitor Claude Code and Codex usage limits in separate VS Code status bar indicators.",
-  "version": "0.3.3",
+  "displayName": "Claude, Codex & Devin Limits",
+  "description": "Monitor Claude Code, Codex, and Devin usage in separate VS Code status bar indicators.",
+  "version": "0.4.0",
   "publisher": "maslovserg",
   "icon": "icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/maslovserg-hub/claude-limits-vscode"
+    "url": "https://github.com/fstandhartinger/agent-limits-vscode"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -23,11 +23,11 @@
     "commands": [
       {
         "command": "claudeLimits.refresh",
-        "title": "Claude & Codex Limits: Refresh"
+        "title": "Agent Limits: Refresh"
       }
     ],
     "configuration": {
-      "title": "Claude & Codex Limits",
+      "title": "Agent Limits",
       "properties": {
         "claudeLimits.language": {
           "type": "string",
@@ -71,6 +71,42 @@
           ],
           "default": "auto",
           "description": "Controls Codex limits visibility"
+        },
+        "claudeLimits.devinVisibility": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "always",
+            "hidden"
+          ],
+          "enumDescriptions": [
+            "Show only when the Devin API key file is present",
+            "Always show the Devin indicator",
+            "Always hide the Devin indicator"
+          ],
+          "default": "auto",
+          "description": "Controls Devin visibility"
+        },
+        "claudeLimits.showProgressBars": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show progress bars for Claude and Codex. Disable to save status bar space; percentages and reset times remain visible."
+        }
+      }
+    },
+    "icons": {
+      "claude-limits-claude": {
+        "description": "Claude service logo",
+        "default": {
+          "fontPath": "./resources/service-icons.woff",
+          "fontCharacter": "\\E001"
+        }
+      },
+      "claude-limits-codex": {
+        "description": "Codex service logo",
+        "default": {
+          "fontPath": "./resources/service-icons.woff",
+          "fontCharacter": "\\E002"
         }
       }
     }

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as https from 'https';
 import { spawn } from 'child_process';
 import { parseLimits, formatStatusText, parseCodexLimitsFromSessionLog, parseCodexLimitsFromWhamUsage, parseCodexLimitsFromAppServerRateLimits, parseCodexAccountLabel, formatCodexStatusText, shouldShowService, CodexLimitsData, VisibilityMode, Lang } from './limits';
 
@@ -12,8 +13,63 @@ const HOOK_SCRIPT = path.join(HOOKS_DIR, 'save-limits.sh');
 const CLAUDE_SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
 const CREDS_FILE = path.join(CLAUDE_DIR, '.credentials.json');
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+const DEVIN_API_KEY_FILE = path.join(os.homedir(), '.config', 'devin', 'api_key');
 // Пять минут вместо минуты: эндпоинт лимитов не публичный и при частых запросах отвечает 429.
 const REFRESH_INTERVAL_MS = 300_000;
+const DEVIN_REFRESH_INTERVAL_MS = 300_000;
+
+interface DevinUsageData {
+  trailing7dAcus: number;
+}
+
+interface DevinApiResult {
+  status: number;
+  body: string;
+}
+
+function requestDevinApi(pathname: string, apiKey: string): Promise<DevinApiResult> {
+  return new Promise(resolve => {
+    let settled = false;
+    let body = '';
+    const finish = (status: number, responseBody: string) => {
+      if (settled) return;
+      settled = true;
+      resolve({ status, body: responseBody });
+    };
+    const request = https.get(`https://api.devin.ai${pathname}`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      timeout: 15_000,
+    }, response => {
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => finish(response.statusCode || 0, body));
+      response.on('error', () => finish(0, ''));
+    });
+    request.on('timeout', () => request.destroy(new Error('request timeout')));
+    request.on('error', () => finish(0, ''));
+  });
+}
+
+async function fetchDevinUsage(): Promise<DevinUsageData> {
+  const apiKey = fs.readFileSync(DEVIN_API_KEY_FILE, 'utf8').trim();
+  if (!apiKey) throw new Error('empty API key file');
+
+  const selfResponse = await requestDevinApi('/v3/self', apiKey);
+  if (selfResponse.status !== 200) throw new Error(`HTTP ${selfResponse.status || 'network error'} from /v3/self`);
+  const self = JSON.parse(selfResponse.body) as { org_id?: unknown };
+  if (typeof self?.org_id !== 'string' || !self.org_id) throw new Error('v3/self omitted org_id');
+
+  const now = Math.floor(Date.now() / 1000);
+  const after = now - 7 * 24 * 60 * 60;
+  const consumptionPath = `/v3/organizations/${encodeURIComponent(self.org_id)}/consumption/daily?time_after=${after}&time_before=${now}`;
+  const usageResponse = await requestDevinApi(consumptionPath, apiKey);
+  if (usageResponse.status !== 200) throw new Error(`HTTP ${usageResponse.status || 'network error'} from consumption API`);
+  const usage = JSON.parse(usageResponse.body) as { total_acus?: unknown };
+  if (typeof usage?.total_acus !== 'number' || !Number.isFinite(usage.total_acus)) {
+    throw new Error('consumption response omitted total_acus');
+  }
+  return { trailing7dAcus: usage.total_acus };
+}
 
 function findLatestCodexSessionFiles(dir: string, limit = 20): string[] {
   const files: { file: string; mtimeMs: number }[] = [];
@@ -55,8 +111,8 @@ function readLatestCodexLimits() {
   return null;
 }
 
-function fetchCodexLimits(onAccountLabel: (label: string) => void): Promise<CodexLimitsData | null> {
-  return fetchCodexLimitsFromAppServer(onAccountLabel);
+function fetchCodexLimits(onAccountLabel: (label: string) => void, onError: (error: string) => void): Promise<CodexLimitsData | null> {
+  return fetchCodexLimitsFromAppServer(onAccountLabel, onError);
 }
 
 // Запасной источник аккаунта: app-server стал отвечать account: null, но логин лежит в ~/.codex/auth.json.
@@ -70,6 +126,15 @@ function readCodexAccountLabel(): string {
 }
 
 function findCodexExecutable(): string | null {
+  const extension = vscode.extensions.getExtension('openai.chatgpt');
+  if (extension) {
+    const platformDir = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux';
+    const architecture = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+    const binary = process.platform === 'win32' ? 'codex.exe' : 'codex';
+    const bundled = path.join(extension.extensionPath, 'bin', platformDir + '-' + architecture, binary);
+    if (fs.existsSync(bundled)) return bundled;
+  }
+
   const desktopBin = path.join(os.homedir(), 'AppData', 'Local', 'OpenAI', 'Codex', 'bin');
   try {
     const versions = fs.readdirSync(desktopBin, { withFileTypes: true })
@@ -78,13 +143,28 @@ function findCodexExecutable(): string | null {
       .filter(file => fs.existsSync(file));
     if (versions.length > 0) return versions[versions.length - 1];
   } catch {}
-  return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+
+  // Spawn a native binary; Windows .cmd launchers require a shell.
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    const base = dir.replace(/^"|"$/g, '');
+    const binary = path.join(base, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    if (fs.existsSync(binary)) return binary;
+    if (process.platform === 'win32') {
+      const architecture = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+      const vendor = path.join(base, 'node_modules', '@openai', 'codex', 'node_modules', '@openai',
+        process.arch === 'arm64' ? 'codex-win32-arm64' : 'codex-win32-x64', 'vendor',
+        architecture + '-pc-windows-msvc', 'codex', 'codex.exe');
+      if (fs.existsSync(vendor)) return vendor;
+    }
+  }
+  return process.platform === 'win32' ? null : 'codex';
 }
 
-function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void): Promise<CodexLimitsData | null> {
+function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void, onError: (error: string) => void): Promise<CodexLimitsData | null> {
   return new Promise(resolve => {
     const executable = findCodexExecutable();
     if (!executable) {
+      onError('CLI not found');
       resolve(null);
       return;
     }
@@ -97,9 +177,10 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void):
       windowsHide: true,
     });
 
-    function finish(limits: CodexLimitsData | null): void {
+    function finish(limits: CodexLimitsData | null, error = ''): void {
       if (settled) return;
       settled = true;
+      onError(error);
       clearTimeout(timer);
       try { child.kill(); } catch {}
       resolve(limits);
@@ -109,13 +190,15 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void):
       try {
         child.stdin.write(JSON.stringify(message) + '\n');
       } catch {
-        finish(null);
+        finish(null, 'CLI input failed');
       }
     }
 
-    const timer = setTimeout(() => finish(null), 10_000);
+    const timer = setTimeout(() => finish(null, 'Request timed out'), 10_000);
 
-    child.on('error', () => finish(null));
+    child.on('error', error => finish(null, 'CLI: ' + ((error as NodeJS.ErrnoException).code || 'start failed')));
+    child.on('close', () => finish(null, 'CLI exited before returning limits'));
+    child.stdin.on('error', error => finish(null, 'CLI input: ' + ((error as NodeJS.ErrnoException).code || 'failed')));
     child.stdout.on('data', (chunk: Buffer) => {
       buffer += chunk.toString();
       let newlineIndex = buffer.indexOf('\n');
@@ -126,6 +209,10 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void):
         if (!line) continue;
         try {
           const message = JSON.parse(line);
+          if (message.error && [1, 2, 3].includes(message.id)) {
+            finish(null, 'RPC error ' + message.error.code);
+            continue;
+          }
           if (message.id === 1) {
             send({ method: 'initialized', params: {} });
             send({ method: 'account/read', id: 2, params: { refreshToken: true } });
@@ -140,7 +227,8 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void):
             onAccountLabel(name && email ? `${name} (${email})` : email || name);
             send({ method: 'account/rateLimits/read', id: 3 });
           } else if (message.id === 3) {
-            finish(parseCodexLimitsFromAppServerRateLimits(message.result?.rateLimits));
+            const limits = parseCodexLimitsFromAppServerRateLimits(message.result?.rateLimits);
+            finish(limits, limits ? '' : 'No rate limits in response');
           }
         } catch {}
       }
@@ -150,7 +238,7 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void):
       method: 'initialize',
       id: 1,
       params: {
-        clientInfo: { name: 'claude-limits-vscode', title: 'Claude Limits VS Code', version: '0.3.3' },
+        clientInfo: { name: 'agent-limits-vscode', title: 'Agent Limits VS Code', version: '0.4.0' },
       },
     });
   });
@@ -296,9 +384,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   const claudeItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
   const codexItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  const devinItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   claudeItem.command = 'claudeLimits.refresh';
   codexItem.command = 'claudeLimits.refresh';
-  context.subscriptions.push(claudeItem, codexItem);
+  devinItem.command = 'claudeLimits.refresh';
+  context.subscriptions.push(claudeItem, codexItem, devinItem);
 
   const STRINGS: Record<Lang, { tooltip: string; updating: string; codexTooltip: string; staleData: string; noData: string }> = {
     ru: {
@@ -321,8 +411,15 @@ export function activate(context: vscode.ExtensionContext) {
   let cachedCodexAccountLabel = '';
   let cachedCodexLimits: CodexLimitsData | null = null;
   let codexConnected = false;
+  let codexDetected = false;
+  let codexFetchError = '';
   let claudeFetchError = '';
   let dataIsStale = false;
+  let startupGrace = true;
+  let devinConnected = fs.existsSync(DEVIN_API_KEY_FILE);
+  let devinFetchError = '';
+  let cachedDevinUsage: DevinUsageData | null = null;
+  let devinFetchedAt = 0;
 
   function dataAgeMs(): number {
     try {
@@ -340,7 +437,7 @@ export function activate(context: vscode.ExtensionContext) {
   function applyTooltips(lang: Lang): void {
     const claudeLines = [STRINGS[lang].tooltip];
     if (cachedAccountLabel) claudeLines.push(cachedAccountLabel);
-    if (dataIsStale) {
+    if (dataIsStale && !startupGrace) {
       claudeLines.push(claudeFetchError
         ? `⚠ ${STRINGS[lang].staleData} (${claudeFetchError})`
         : `⚠ ${STRINGS[lang].staleData}`);
@@ -349,13 +446,26 @@ export function activate(context: vscode.ExtensionContext) {
     codexItem.tooltip = cachedCodexAccountLabel
       ? `${STRINGS[lang].codexTooltip}\n${cachedCodexAccountLabel}`
       : STRINGS[lang].codexTooltip;
+    if (codexFetchError && !startupGrace) {
+      codexItem.tooltip += `\n⚠ ${STRINGS[lang].noData}: ${codexFetchError}`;
+    }
+    const devinTooltip = [
+      'Devin v3 API — click to refresh',
+      cachedDevinUsage
+        ? `Trailing 7-day consumption: ${cachedDevinUsage.trailing7dAcus.toFixed(2)} ACUs`
+        : 'Trailing 7-day ACU consumption is unavailable',
+      'The documented v3 API does not expose Max weekly quota percent, reset time, or on-demand credit balance.',
+    ];
+    if (devinFetchError && !startupGrace) devinTooltip.push(`⚠ ${devinFetchError}`);
+    if (devinFetchedAt) devinTooltip.push(`Last update: ${new Date(devinFetchedAt).toLocaleTimeString()}`);
+    devinItem.tooltip = devinTooltip.join('\n');
   }
 
   function getLang(): Lang {
     return vscode.workspace.getConfiguration('claudeLimits').get<Lang>('language', 'en');
   }
 
-  function getVisibility(key: 'claudeVisibility' | 'codexVisibility'): VisibilityMode {
+  function getVisibility(key: 'claudeVisibility' | 'codexVisibility' | 'devinVisibility'): VisibilityMode {
     return vscode.workspace.getConfiguration('claudeLimits').get<VisibilityMode>(key, 'auto');
   }
 
@@ -370,6 +480,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   function refresh() {
     const lang = getLang();
+    const showProgressBars = vscode.workspace.getConfiguration('claudeLimits').get<boolean>('showProgressBars', true);
     // Данные пишут двое: сам опрос и Stop-хук. Поэтому «несвежесть» определяется возрастом файла,
     // а не судьбой последнего запроса: пока хук обновляет лимиты, неудачный опрос не повод пугать.
     dataIsStale = isDataStale();
@@ -379,38 +490,85 @@ export function activate(context: vscode.ExtensionContext) {
       const content = fs.readFileSync(LIMITS_FILE, 'utf8');
       const limits = parseLimits(content);
       if (limits) {
-        claudeText = dataIsStale
-          ? `$(warning) ${formatStatusText(limits, lang)}`
-          : formatStatusText(limits, lang);
+        claudeText = dataIsStale && !startupGrace
+          ? `$(warning) ${formatStatusText(limits, lang, showProgressBars)}`
+          : formatStatusText(limits, lang, showProgressBars);
       } else {
-        claudeText = 'Claude: N/A';
+        claudeText = startupGrace ? 'Claude: updating...' : 'Claude: N/A';
       }
     } catch {
-      claudeText = `$(warning) Claude: ${STRINGS[lang].noData}`;
+      claudeText = startupGrace ? 'Claude: updating...' : `$(warning) Claude: ${STRINGS[lang].noData}`;
     }
 
     const codexLimits = cachedCodexLimits ?? readLatestCodexLimits();
-    const codexText = codexLimits ? formatCodexStatusText(codexLimits, lang) : 'Codex: no data';
-    claudeItem.text = claudeText;
-    codexItem.text = codexText;
+    const codexText = codexLimits
+      ? `${codexFetchError && !startupGrace ? '$(warning) ' : ''}${formatCodexStatusText(codexLimits, lang, showProgressBars)}`
+      : startupGrace ? 'Codex: updating...' : `$(warning) Codex: ${STRINGS[lang].noData}`;
+    const devinText = cachedDevinUsage
+      ? `${devinFetchError && !startupGrace ? '$(warning) ' : ''}Devin: 7d ${cachedDevinUsage.trailing7dAcus.toFixed(2)} ACU`
+      : startupGrace ? 'Devin: updating...' : `$(warning) Devin: ${devinFetchError || 'quota data unavailable'}`;
+    claudeItem.text = '$(claude-limits-claude) ' + claudeText;
+    codexItem.text = '$(claude-limits-codex) ' + codexText;
+    devinItem.text = devinText;
     if (shouldShowService(getVisibility('claudeVisibility'), isClaudeConnected())) {
       claudeItem.show();
     } else {
       claudeItem.hide();
     }
-    if (shouldShowService(getVisibility('codexVisibility'), codexConnected)) {
+    if (shouldShowService(getVisibility('codexVisibility'), codexConnected || codexDetected)) {
       codexItem.show();
     } else {
       codexItem.hide();
     }
+    if (shouldShowService(getVisibility('devinVisibility'), devinConnected)) {
+      devinItem.show();
+    } else {
+      devinItem.hide();
+    }
+  }
+
+  function fetchCodexAndRefresh() {
+    codexDetected = Boolean(vscode.extensions.getExtension('openai.chatgpt')) ||
+      fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json'));
+    fetchCodexLimits(label => {
+      cachedCodexAccountLabel = label || readCodexAccountLabel();
+      applyTooltips(getLang());
+    }, error => { codexFetchError = error; }).then(limits => {
+      if (!cachedCodexAccountLabel) cachedCodexAccountLabel = readCodexAccountLabel();
+      if (limits) cachedCodexLimits = limits;
+      codexConnected = Boolean(limits || cachedCodexAccountLabel);
+      refresh();
+    });
+  }
+
+  function fetchDevinAndRefresh(manualRefresh = false) {
+    devinConnected = fs.existsSync(DEVIN_API_KEY_FILE);
+    if (!devinConnected) {
+      devinFetchError = 'no ~/.config/devin/api_key file';
+      refresh();
+      return;
+    }
+    if (!manualRefresh && Date.now() - devinFetchedAt < DEVIN_REFRESH_INTERVAL_MS) {
+      refresh();
+      return;
+    }
+    devinFetchedAt = Date.now();
+    fetchDevinUsage().then(usage => {
+      cachedDevinUsage = usage;
+      devinFetchError = '';
+    }).catch(error => {
+      devinFetchError = error instanceof Error ? error.message : 'request failed';
+    }).finally(refresh);
   }
 
   function fetchAndRefresh(manualRefresh = false) {
     if (manualRefresh) {
-      claudeItem.text = STRINGS[getLang()].updating;
-      codexItem.text = '$(sync~spin) Codex: updating...';
+      claudeItem.text = '$(claude-limits-claude) ' + STRINGS[getLang()].updating;
+      codexItem.text = '$(claude-limits-codex) $(sync~spin) Codex: updating...';
+      devinItem.text = '$(sync~spin) Devin: updating...';
       if (shouldShowService(getVisibility('claudeVisibility'), isClaudeConnected())) claudeItem.show();
-      if (shouldShowService(getVisibility('codexVisibility'), codexConnected)) codexItem.show();
+      if (shouldShowService(getVisibility('codexVisibility'), codexConnected || codexDetected)) codexItem.show();
+      if (shouldShowService(getVisibility('devinVisibility'), fs.existsSync(DEVIN_API_KEY_FILE))) devinItem.show();
     }
 
     fetchAccountLabel().then(label => {
@@ -418,15 +576,8 @@ export function activate(context: vscode.ExtensionContext) {
       applyTooltips(getLang());
     });
 
-    fetchCodexLimits(label => {
-      cachedCodexAccountLabel = label || readCodexAccountLabel();
-      applyTooltips(getLang());
-    }).then(limits => {
-      if (!cachedCodexAccountLabel) cachedCodexAccountLabel = readCodexAccountLabel();
-      cachedCodexLimits = limits;
-      codexConnected = Boolean(limits);
-      refresh();
-    });
+    fetchCodexAndRefresh();
+    fetchDevinAndRefresh(manualRefresh);
 
     const token = readToken();
     if (!token) { claudeFetchError = 'no credentials'; refresh(); return; }
@@ -478,15 +629,25 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
     if (
+      e.affectsConfiguration('claudeLimits.showProgressBars') ||
       e.affectsConfiguration('claudeLimits.language') ||
       e.affectsConfiguration('claudeLimits.claudeVisibility') ||
-      e.affectsConfiguration('claudeLimits.codexVisibility')
+      e.affectsConfiguration('claudeLimits.codexVisibility') ||
+      e.affectsConfiguration('claudeLimits.devinVisibility')
     ) {
       refresh();
     }
   }));
 
   fetchAndRefresh();
+  const startupTimers = [10_000, 20_000].map(delay => setTimeout(() => {
+    if (codexFetchError) fetchCodexAndRefresh();
+  }, delay));
+  startupTimers.push(setTimeout(() => {
+    startupGrace = false;
+    refresh();
+  }, 30_000));
+  context.subscriptions.push({ dispose: () => startupTimers.forEach(clearTimeout) });
 }
 
 export function deactivate() {}

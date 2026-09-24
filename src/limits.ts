@@ -76,12 +76,12 @@ export function formatTimeRemaining(resetsAt: string): string {
   const diff = new Date(resetsAt).getTime() - Date.now();
   if (diff <= 0) return '';
   const mins = Math.floor(diff / 60000);
-  if (mins < 60) return `${mins}м`;
+  if (mins < 60) return `${mins}m`;
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}ч`;
+  if (hours < 24) return `${hours}h`;
   const days = Math.floor(hours / 24);
   const remHours = hours % 24;
-  return remHours > 0 ? `${days}д${remHours}ч` : `${days}д`;
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
 }
 
 export type Lang = 'ru' | 'en';

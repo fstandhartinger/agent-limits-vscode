@@ -282,3 +282,52 @@ export function parseCodexAccountLabel(idToken: unknown): string {
     return '';
   }
 }
+
+export interface DevinQuotaData {
+  weeklyPercent: number;
+  weeklyResetsAt?: string;
+  dailyPercent?: number;
+  dailyResetsAt?: string;
+  onDemandCreditsUsd?: number;
+  trailing7dAcus?: number;
+  sampledAt?: string;
+  lastError?: string;
+}
+
+// Written on Sandy by ~/bin/devin-usage-log from app.devin.ai's own settings/usage endpoint.
+export function parseDevinQuota(jsonStr: string): DevinQuotaData | null {
+  try {
+    const d = JSON.parse(jsonStr);
+    const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const str = (v: unknown) => typeof v === 'string' && v ? v : undefined;
+    const weeklyPercent = num(d?.weekly_percent);
+    if (weeklyPercent === undefined) return null;
+    return {
+      weeklyPercent,
+      weeklyResetsAt: str(d.weekly_reset_at),
+      dailyPercent: d.hide_daily_quota === true ? undefined : num(d.daily_percent),
+      dailyResetsAt: str(d.daily_reset_at),
+      onDemandCreditsUsd: num(d.on_demand_credits_usd),
+      trailing7dAcus: num(d.trailing_7d_acus),
+      sampledAt: str(d.quota_sampled_at),
+      lastError: str(d.last_error),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export const DEVIN_QUOTA_STALE_MS = 90 * 60_000;
+
+export function isDevinQuotaStale(quota: DevinQuotaData, now = Date.now()): boolean {
+  const at = quota.sampledAt ? new Date(quota.sampledAt).getTime() : NaN;
+  return !Number.isFinite(at) || now - at > DEVIN_QUOTA_STALE_MS;
+}
+
+export function formatDevinStatusText(quota: DevinQuotaData, lang: Lang = 'en', showProgressBars = true): string {
+  const pct = Math.round(quota.weeklyPercent);
+  const bar = showProgressBars ? formatProgressBar(Math.min(100, Math.max(0, pct))) + ' ' : '';
+  const time = quota.weeklyResetsAt ? formatTimeRemaining(quota.weeklyResetsAt) : '';
+  const daily = typeof quota.dailyPercent === 'number' ? ` · D ${Math.round(quota.dailyPercent)}%` : '';
+  return `Devin ${LABELS[lang].week}: ${bar}${getStatusEmoji(pct)}${pct}%${time ? ` (~${time})` : ''}${daily}`;
+}

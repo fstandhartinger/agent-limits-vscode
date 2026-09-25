@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseLimits,
+  parseDevinQuota,
+  isDevinQuotaStale,
+  formatDevinStatusText,
   formatProgressBar,
   getColor,
   getStatusEmoji,
@@ -312,5 +315,40 @@ describe('parseCodexAccountLabel', () => {
     expect(parseCodexAccountLabel('header.@@@notbase64@@@.signature')).toBe('');
     expect(parseCodexAccountLabel(undefined)).toBe('');
     expect(parseCodexAccountLabel(null)).toBe('');
+  });
+});
+
+describe('Devin quota', () => {
+  const sample = JSON.stringify({
+    weekly_percent: 32, weekly_reset_at: '2026-09-27T00:00:00-08:00', daily_percent: 0,
+    daily_reset_at: '2026-09-26T00:00:00-08:00', hide_daily_quota: true, on_demand_credits_usd: 10,
+    trailing_7d_acus: 0, quota_sampled_at: '2026-09-25T13:15:58+00:00', last_error: null,
+  });
+
+  it('parses the Sandy summary and hides the daily quota when the page hides it', () => {
+    const q = parseDevinQuota(sample)!;
+    expect(q.weeklyPercent).toBe(32);
+    expect(q.dailyPercent).toBeUndefined();
+    expect(q.onDemandCreditsUsd).toBe(10);
+    expect(q.lastError).toBeUndefined();
+  });
+
+  it('rejects summaries without a weekly percent', () => {
+    expect(parseDevinQuota('{"weekly_percent":null}')).toBeNull();
+    expect(parseDevinQuota('not json')).toBeNull();
+  });
+
+  it('marks samples older than 90 minutes as stale', () => {
+    const q = parseDevinQuota(sample)!;
+    const at = new Date('2026-09-25T13:15:58Z').getTime();
+    expect(isDevinQuotaStale(q, at + 60 * 60_000)).toBe(false);
+    expect(isDevinQuotaStale(q, at + 91 * 60_000)).toBe(true);
+    expect(isDevinQuotaStale({ weeklyPercent: 1 })).toBe(true);
+  });
+
+  it('formats percent, reset and optional daily quota', () => {
+    const q = { weeklyPercent: 32, weeklyResetsAt: new Date(Date.now() + 26 * 3600_000 + 60_000).toISOString() };
+    expect(formatDevinStatusText(q, 'en', false)).toBe('Devin Week: 32% (~1d 2h)');
+    expect(formatDevinStatusText({ weeklyPercent: 85, dailyPercent: 40 }, 'en', false)).toBe('Devin Week: 🔴85% · D 40%');
   });
 });

@@ -1,19 +1,23 @@
 # Claude, Codex & Devin Limits
 
-Monitor Claude Code, Codex, and Devin in separate VS Code status bar items. Claude and Codex keep their existing usage indicators; Devin adds a third item based on the documented v3 consumption API.
+Monitor Claude Code, Codex, and Devin in separate VS Code status bar items. Claude and Codex keep their existing usage indicators; Devin adds a third item with the Max plan's weekly quota, read from the same endpoint as app.devin.ai's settings/usage page.
 
 ## Status bar
 
 - **Claude:** 5-hour session, 7-day usage, and the optional 7-day Sonnet limit.
 - **Codex:** current account-scoped OAuth rate limits first, then the local Codex app-server, with recent session logs as a display fallback. Model-specific windows are shown when the endpoint returns them.
-- **Devin:** ACUs consumed over the trailing 7 days, when the local Devin API key can read the account’s organization consumption.
+- **Devin:** weekly quota % used and time to reset (plus the daily quota when Devin shows one). The tooltip adds on-demand credits, trailing 7-day organization ACUs and when Sandy last measured. If the quota summary is unreachable, it falls back to trailing 7-day ACUs from the v3 API key.
 - **Refresh:** click any indicator to refresh all three.
 - **Refresh interval:** five minutes.
 - **Visibility:** each service supports `auto`, `always`, and `hidden`.
 
-The current Devin v3 schema returns ACU consumption but does not expose the individual Max plan’s weekly quota percentage, reset timestamp, or on-demand credit balance. The Devin status item therefore shows the trailing 7-day ACU total and its tooltip states that those three values are unavailable; it does not infer a percentage or credit balance.
+## Devin quota source
 
-## Devin API access
+The public v3 API has no quota percentage. The app's settings/usage page calls `GET https://app.devin.ai/api/{org_id}/billing/quota/usage` with the web session's bearer token and `x-cog-org-id`. It returns `weekly_percentage`, `weekly_reset_at`, `daily_percentage`, `daily_reset_at`, `hide_daily_quota` and `overage_balance`.
+
+The extension does not call it itself. On Sandy, `~/bin/devin-usage-log` (30-minute systemd timer) calls it and writes a secret-free summary to `~/.local/state/agent-limits/devin-latest.json`. The extension reads that file directly when it exists (VS Code on Sandy or Remote-SSH). Otherwise it runs `ssh -o BatchMode=yes <claudeLimits.devinSshHost> cat .local/state/agent-limits/devin-latest.json` (default host `sandy`). On Windows it also tries `wsl.exe -e ssh ...`. Readings older than 90 minutes get a warning icon.
+
+## Devin API access (optional ACU fallback)
 
 The extension reads the admin key from `~/.config/devin/api_key` on the VS Code extension host. In a WSL remote window, this means the Linux home directory in the WSL environment. The key is held in memory and sent only over HTTPS to `api.devin.ai`; it is not included in the VSIX, stored by the extension, or written to logs.
 
@@ -35,6 +39,7 @@ Open VS Code Settings and search for **Agent Limits**.
 | `claudeLimits.claudeVisibility` | `auto`, `always`, `hidden` | `auto` | Claude indicator visibility |
 | `claudeLimits.codexVisibility` | `auto`, `always`, `hidden` | `auto` | Codex indicator visibility |
 | `claudeLimits.devinVisibility` | `auto`, `always`, `hidden` | `auto` | Devin indicator visibility |
+| `claudeLimits.devinSshHost` | host name | `sandy` | SSH host that publishes the Devin quota summary; empty disables |
 | `claudeLimits.showProgressBars` | `true`, `false` | `true` | Show or hide Claude and Codex progress bars |
 
 ## Install the VSIX

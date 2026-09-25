@@ -2,7 +2,7 @@
   "name": "claude-limits",
   "displayName": "Claude, Codex & Devin Limits",
   "description": "Monitor Claude Code, Codex, and Devin usage in separate VS Code status bar indicators.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "publisher": "maslovserg",
   "icon": "icon.png",
   "repository": {
@@ -80,12 +80,17 @@
             "hidden"
           ],
           "enumDescriptions": [
-            "Show only when the Devin API key file is present",
+            "Show when a Devin quota source is configured (local summary file, SSH host, or API key file)",
             "Always show the Devin indicator",
             "Always hide the Devin indicator"
           ],
           "default": "auto",
           "description": "Controls Devin visibility"
+        },
+        "claudeLimits.devinSshHost": {
+          "type": "string",
+          "default": "sandy",
+          "description": "SSH host that publishes the Devin quota summary (~/.local/state/agent-limits/devin-latest.json). Read with `ssh <host> cat ...` using key-based auth; on Windows `wsl.exe ssh` is tried when Windows ssh fails. Leave empty to disable. Not used when the file exists locally."
         },
         "claudeLimits.showProgressBars": {
           "type": "boolean",

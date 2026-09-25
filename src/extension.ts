@@ -3,8 +3,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as https from 'https';
-import { spawn } from 'child_process';
-import { parseLimits, formatStatusText, parseCodexLimitsFromSessionLog, parseCodexLimitsFromWhamUsage, parseCodexLimitsFromAppServerRateLimits, parseCodexAccountLabel, formatCodexStatusText, shouldShowService, CodexLimitsData, VisibilityMode, Lang } from './limits';
+import { spawn, execFile } from 'child_process';
+import { parseLimits, formatStatusText, parseCodexLimitsFromSessionLog, parseCodexLimitsFromWhamUsage, parseCodexLimitsFromAppServerRateLimits, parseCodexAccountLabel, formatCodexStatusText, parseDevinQuota, isDevinQuotaStale, formatDevinStatusText, DevinQuotaData, shouldShowService, CodexLimitsData, VisibilityMode, Lang } from './limits';
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const LIMITS_FILE = path.join(CLAUDE_DIR, 'limits.json');
@@ -18,6 +18,9 @@ const CODEX_HOME_DIR = process.env.CODEX_HOME?.trim()
 const CODEX_AUTH_FILE = path.join(CODEX_HOME_DIR, 'auth.json');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME_DIR, 'sessions');
 const DEVIN_API_KEY_FILE = path.join(os.homedir(), '.config', 'devin', 'api_key');
+// Secret-free summary written every 30 min on Sandy by ~/bin/devin-usage-log (weekly %, reset, credits).
+const DEVIN_QUOTA_RELATIVE = '.local/state/agent-limits/devin-latest.json';
+const DEVIN_QUOTA_LOCAL_FILE = path.join(os.homedir(), ...DEVIN_QUOTA_RELATIVE.split('/'));
 // Пять минут вместо минуты: эндпоинт лимитов не публичный и при частых запросах отвечает 429.
 const REFRESH_INTERVAL_MS = 300_000;
 const DEVIN_REFRESH_INTERVAL_MS = 300_000;
@@ -52,6 +55,49 @@ function requestDevinApi(pathname: string, apiKey: string): Promise<DevinApiResu
     request.on('timeout', () => request.destroy(new Error('request timeout')));
     request.on('error', () => finish(0, ''));
   });
+}
+
+function runForStdout(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { timeout: 20_000, windowsHide: true, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        reject(new Error(code === 'ENOENT' ? `${command} not found` : (String(stderr).trim().split('\n').pop() || error.message)));
+      } else {
+        resolve(String(stdout));
+      }
+    });
+  });
+}
+
+function getDevinSshHost(): string {
+  return (vscode.workspace.getConfiguration('claudeLimits').get<string>('devinSshHost', 'sandy') || '').trim();
+}
+
+// Local file when VS Code runs on Sandy (or Remote-SSH); otherwise `ssh <host> cat` the same file.
+async function fetchDevinQuota(): Promise<{ quota: DevinQuotaData; source: string }> {
+  let raw: string;
+  let source: string;
+  if (fs.existsSync(DEVIN_QUOTA_LOCAL_FILE)) {
+    raw = fs.readFileSync(DEVIN_QUOTA_LOCAL_FILE, 'utf8');
+    source = DEVIN_QUOTA_LOCAL_FILE;
+  } else {
+    const host = getDevinSshHost();
+    if (!host) throw new Error('no local Devin quota file and claudeLimits.devinSshHost is empty');
+    const sshArgs = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, 'cat', DEVIN_QUOTA_RELATIVE];
+    try {
+      raw = await runForStdout('ssh', sshArgs);
+      source = `ssh ${host}`;
+    } catch (error) {
+      // Windows: the working `ssh sandy` config may live in WSL rather than in the Windows OpenSSH profile.
+      if (process.platform !== 'win32') throw error;
+      raw = await runForStdout('wsl.exe', ['-e', 'ssh', ...sshArgs]);
+      source = `wsl ssh ${host}`;
+    }
+  }
+  const quota = parseDevinQuota(raw);
+  if (!quota) throw new Error('Devin quota summary has no weekly percent');
+  return { quota, source };
 }
 
 async function fetchDevinUsage(): Promise<DevinUsageData> {
@@ -499,7 +545,12 @@ export function activate(context: vscode.ExtensionContext) {
   let claudeFetchError = '';
   let dataIsStale = false;
   let startupGrace = true;
-  let devinConnected = fs.existsSync(DEVIN_API_KEY_FILE);
+  const isDevinConfigured = () =>
+    fs.existsSync(DEVIN_QUOTA_LOCAL_FILE) || getDevinSshHost() !== '' || fs.existsSync(DEVIN_API_KEY_FILE);
+  let devinConnected = isDevinConfigured();
+  let cachedDevinQuota: DevinQuotaData | null = null;
+  let devinQuotaSource = '';
+  let devinQuotaError = '';
   let devinFetchError = '';
   let cachedDevinUsage: DevinUsageData | null = null;
   let devinFetchedAt = 0;
@@ -532,14 +583,23 @@ export function activate(context: vscode.ExtensionContext) {
     if (codexFetchError && !startupGrace) {
       codexItem.tooltip += `\n⚠ ${STRINGS[lang].noData}: ${codexFetchError}`;
     }
-    const devinTooltip = [
+    const devinTooltip = cachedDevinQuota ? [
+      `Devin Max quota (app.devin.ai settings/usage via ${devinQuotaSource}) — click to refresh`,
+      `Weekly: ${cachedDevinQuota.weeklyPercent}% used` + (cachedDevinQuota.weeklyResetsAt ? `, resets ${new Date(cachedDevinQuota.weeklyResetsAt).toLocaleString()}` : ''),
+      ...(typeof cachedDevinQuota.dailyPercent === 'number' ? [`Daily: ${cachedDevinQuota.dailyPercent}% used`] : []),
+      ...(typeof cachedDevinQuota.onDemandCreditsUsd === 'number' ? [`On-demand credits: $${cachedDevinQuota.onDemandCreditsUsd.toFixed(2)}`] : []),
+      ...(typeof cachedDevinQuota.trailing7dAcus === 'number' ? [`Organization ACUs, trailing 7 days: ${cachedDevinQuota.trailing7dAcus.toFixed(2)}`] : []),
+      ...(cachedDevinQuota.sampledAt ? [`Measured on Sandy: ${new Date(cachedDevinQuota.sampledAt).toLocaleString()}${isDevinQuotaStale(cachedDevinQuota) ? ' (stale)' : ''}`] : []),
+      ...(cachedDevinQuota.lastError ? [`Last Sandy collector error: ${cachedDevinQuota.lastError}`] : []),
+    ] : [
       'Devin v3 API — click to refresh',
       cachedDevinUsage
         ? `Trailing 7-day consumption: ${cachedDevinUsage.trailing7dAcus.toFixed(2)} ACUs`
         : 'Trailing 7-day ACU consumption is unavailable',
       'The documented v3 API does not expose Max weekly quota percent, reset time, or on-demand credit balance.',
     ];
-    if (devinFetchError && !startupGrace) devinTooltip.push(`⚠ ${devinFetchError}`);
+    if (devinQuotaError && !startupGrace) devinTooltip.push(`⚠ quota: ${devinQuotaError}`);
+    if (devinFetchError && !startupGrace && !cachedDevinQuota) devinTooltip.push(`⚠ ${devinFetchError}`);
     if (devinFetchedAt) devinTooltip.push(`Last update: ${new Date(devinFetchedAt).toLocaleTimeString()}`);
     devinItem.tooltip = devinTooltip.join('\n');
   }
@@ -587,9 +647,11 @@ export function activate(context: vscode.ExtensionContext) {
     const codexText = codexLimits
       ? `${codexFetchError && !startupGrace ? '$(warning) ' : ''}${formatCodexStatusText(codexLimits, lang, showProgressBars)}`
       : startupGrace ? 'Codex: updating...' : `$(warning) Codex: ${STRINGS[lang].noData}`;
-    const devinText = cachedDevinUsage
+    const devinText = cachedDevinQuota
+      ? `${(devinQuotaError || isDevinQuotaStale(cachedDevinQuota)) && !startupGrace ? '$(warning) ' : ''}${formatDevinStatusText(cachedDevinQuota, lang, showProgressBars)}`
+      : cachedDevinUsage
       ? `${devinFetchError && !startupGrace ? '$(warning) ' : ''}Devin: 7d ${cachedDevinUsage.trailing7dAcus.toFixed(2)} ACU`
-      : startupGrace ? 'Devin: updating...' : `$(warning) Devin: ${devinFetchError || 'quota data unavailable'}`;
+      : startupGrace ? 'Devin: updating...' : `$(warning) Devin: ${devinQuotaError || devinFetchError || 'quota data unavailable'}`;
     claudeItem.text = '$(claude-limits-claude) ' + claudeText;
     codexItem.text = '$(claude-limits-codex) ' + codexText;
     devinItem.text = devinText;
@@ -624,23 +686,29 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   function fetchDevinAndRefresh(manualRefresh = false) {
-    devinConnected = fs.existsSync(DEVIN_API_KEY_FILE);
-    if (!devinConnected) {
-      devinFetchError = 'no ~/.config/devin/api_key file';
-      refresh();
-      return;
-    }
+    devinConnected = isDevinConfigured();
     if (!manualRefresh && Date.now() - devinFetchedAt < DEVIN_REFRESH_INTERVAL_MS) {
       refresh();
       return;
     }
     devinFetchedAt = Date.now();
-    fetchDevinUsage().then(usage => {
-      cachedDevinUsage = usage;
-      devinFetchError = '';
+    const quotaRequest = fetchDevinQuota().then(({ quota, source }) => {
+      cachedDevinQuota = quota;
+      devinQuotaSource = source;
+      devinQuotaError = '';
     }).catch(error => {
-      devinFetchError = error instanceof Error ? error.message : 'request failed';
-    }).finally(refresh);
+      devinQuotaError = error instanceof Error ? error.message : 'request failed';
+    });
+    // The v3 API key is optional: it only adds the ACU fallback when the quota summary is unreachable.
+    const acuRequest = !fs.existsSync(DEVIN_API_KEY_FILE)
+      ? Promise.resolve().then(() => { devinFetchError = ''; })
+      : fetchDevinUsage().then(usage => {
+        cachedDevinUsage = usage;
+        devinFetchError = '';
+      }).catch(error => {
+        devinFetchError = error instanceof Error ? error.message : 'request failed';
+      });
+    Promise.all([quotaRequest, acuRequest]).finally(refresh);
   }
 
   function fetchAndRefresh(manualRefresh = false) {
@@ -650,7 +718,7 @@ export function activate(context: vscode.ExtensionContext) {
       devinItem.text = '$(sync~spin) Devin: updating...';
       if (shouldShowService(getVisibility('claudeVisibility'), isClaudeConnected())) claudeItem.show();
       if (shouldShowService(getVisibility('codexVisibility'), codexConnected || codexDetected)) codexItem.show();
-      if (shouldShowService(getVisibility('devinVisibility'), fs.existsSync(DEVIN_API_KEY_FILE))) devinItem.show();
+      if (shouldShowService(getVisibility('devinVisibility'), isDevinConfigured())) devinItem.show();
     }
 
     fetchAccountLabel().then(label => {
@@ -719,6 +787,7 @@ export function activate(context: vscode.ExtensionContext) {
     ) {
       refresh();
     }
+    if (e.affectsConfiguration('claudeLimits.devinSshHost')) fetchDevinAndRefresh(true);
   }));
 
   fetchAndRefresh();

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.0]
+- Devin now shows the Max plan's weekly quota % and time to reset. The value comes from the endpoint behind app.devin.ai settings/usage (`/api/{org}/billing/quota/usage`), collected on Sandy and read from `~/.local/state/agent-limits/devin-latest.json` locally or over `ssh <claudeLimits.devinSshHost> cat` (Windows falls back to `wsl.exe ssh`).
+- The tooltip adds the daily quota (when shown), on-demand credits, trailing 7-day ACUs and the sample time. Readings older than 90 minutes are flagged.
+- The v3 API key is now optional and only used as an ACU fallback.
+
 ## [0.4.1]
 - Codex now reads the account-scoped OAuth usage endpoint first, including provider reset timestamps, then falls back to the local Codex app-server and session logs.
 - Shows model-specific Codex rate windows returned by the OAuth endpoint when available.

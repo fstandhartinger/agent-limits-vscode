@@ -18,6 +18,7 @@ export interface CodexLimitsData {
   primary?: CodexLimitWindow;
   secondary?: CodexLimitWindow;
   individual?: CodexLimitWindow;
+  additional?: CodexLimitWindow[];
   planType?: string;
 }
 
@@ -191,15 +192,31 @@ export function parseCodexLimitsFromWhamUsage(jsonStr: string): CodexLimitsData 
   try {
     const data = JSON.parse(jsonStr);
     const rateLimit = data?.rate_limit ?? data?.rateLimit;
-    if (!rateLimit) return null;
-    const primary = parseCodexWindow(rateLimit.primary_window ?? rateLimit.primaryWindow);
-    const secondary = parseCodexWindow(rateLimit.secondary_window ?? rateLimit.secondaryWindow);
-    const individual = parseCodexWindow(rateLimit.individual_limit ?? rateLimit.individualLimit, 'I');
-    if (!primary && !secondary && !individual) return null;
+    const primary = parseCodexWindow(rateLimit?.primary_window ?? rateLimit?.primaryWindow);
+    const secondary = parseCodexWindow(rateLimit?.secondary_window ?? rateLimit?.secondaryWindow);
+    const individual = parseCodexWindow(
+      data?.individual_limit ?? data?.individualLimit ?? rateLimit?.individual_limit ?? rateLimit?.individualLimit,
+      'I',
+    );
+    const additional = Array.isArray(data?.additional_rate_limits)
+      ? data.additional_rate_limits.flatMap((entry: any) => {
+          const details = entry?.rate_limit ?? entry?.rateLimit;
+          if (!details) return [];
+          const label = typeof entry?.limit_name === 'string' ? entry.limit_name
+            : typeof entry?.metered_feature === 'string' ? entry.metered_feature : 'Additional';
+          return [
+            parseCodexWindow(details.primary_window ?? details.primaryWindow, label),
+            parseCodexWindow(details.secondary_window ?? details.secondaryWindow, label),
+            parseCodexWindow(details.individual_limit ?? details.individualLimit, label),
+          ].filter((window): window is CodexLimitWindow => Boolean(window));
+        })
+      : [];
+    if (!primary && !secondary && !individual && additional.length === 0) return null;
     return {
       primary,
       secondary,
       individual,
+      additional,
       planType: typeof data?.plan_type === 'string' ? data.plan_type : undefined,
     };
   } catch {
@@ -229,7 +246,7 @@ function getCodexWindowLabel(windowMinutes: number, lang: Lang): string {
 }
 
 export function formatCodexWindowText(window: CodexLimitWindow, lang: Lang = 'en', showProgressBars = true): string {
-  if (window.label) {
+  if (window.label === 'I') {
     const emoji = getStatusEmoji(window.usedPercent);
     return `${window.label}: ${emoji}${window.usedPercent}%`;
   }
@@ -237,11 +254,14 @@ export function formatCodexWindowText(window: CodexLimitWindow, lang: Lang = 'en
   const bar = showProgressBars ? formatProgressBar(window.usedPercent) + ' ' : '';
   const emoji = getStatusEmoji(window.usedPercent);
   const time = window.resetsAt ? ` (~${formatTimeRemaining(window.resetsAt)})` : '';
-  return `${getCodexWindowLabel(window.windowMinutes, lang)}: ${bar}${emoji}${window.usedPercent}%${time}`;
+  const kind = getCodexWindowLabel(window.windowMinutes, lang);
+  const label = window.label ? `${window.label} ${kind}` : kind;
+  return `${label}: ${bar}${emoji}${window.usedPercent}%${time}`;
 }
 
 export function formatCodexStatusText(limits: CodexLimitsData, lang: Lang = 'en', showProgressBars = true): string {
   const blocks = [limits.secondary, limits.primary, limits.individual]
+    .concat(limits.additional ?? [])
     .filter((window): window is CodexLimitWindow => Boolean(window))
     .sort((a, b) => a.windowMinutes - b.windowMinutes)
     .map(window => formatCodexWindowText(window, lang, showProgressBars));

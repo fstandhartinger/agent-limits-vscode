@@ -12,7 +12,11 @@ const HOOKS_DIR = path.join(CLAUDE_DIR, 'hooks');
 const HOOK_SCRIPT = path.join(HOOKS_DIR, 'save-limits.sh');
 const CLAUDE_SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
 const CREDS_FILE = path.join(CLAUDE_DIR, '.credentials.json');
-const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+const CODEX_HOME_DIR = process.env.CODEX_HOME?.trim()
+  ? path.resolve(process.env.CODEX_HOME.trim())
+  : path.join(os.homedir(), '.codex');
+const CODEX_AUTH_FILE = path.join(CODEX_HOME_DIR, 'auth.json');
+const CODEX_SESSIONS_DIR = path.join(CODEX_HOME_DIR, 'sessions');
 const DEVIN_API_KEY_FILE = path.join(os.homedir(), '.config', 'devin', 'api_key');
 // Пять минут вместо минуты: эндпоинт лимитов не публичный и при частых запросах отвечает 429.
 const REFRESH_INTERVAL_MS = 300_000;
@@ -112,13 +116,92 @@ function readLatestCodexLimits() {
 }
 
 function fetchCodexLimits(onAccountLabel: (label: string) => void, onError: (error: string) => void): Promise<CodexLimitsData | null> {
-  return fetchCodexLimitsFromAppServer(onAccountLabel, onError);
+  return fetchCodexLimitsFromOAuth().then(oauth => {
+    if (oauth.limits) {
+      if (oauth.accountLabel) onAccountLabel(oauth.accountLabel);
+      onError('');
+      return oauth.limits;
+    }
+
+    let appServerError = '';
+    return fetchCodexLimitsFromAppServer(onAccountLabel, error => { appServerError = error; }).then(limits => {
+      onError(limits ? '' : [oauth.error, appServerError].filter(Boolean).join('; '));
+      return limits;
+    });
+  });
 }
 
-// Запасной источник аккаунта: app-server стал отвечать account: null, но логин лежит в ~/.codex/auth.json.
+interface CodexOAuthCredentials {
+  accessToken: string;
+  accountId?: string;
+  accountLabel: string;
+}
+
+interface CodexOAuthFetchResult {
+  limits: CodexLimitsData | null;
+  accountLabel: string;
+  error: string;
+}
+
+function readCodexOAuthCredentials(): CodexOAuthCredentials | null {
+  try {
+    const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_FILE, 'utf8'));
+    const tokens = auth?.tokens;
+    if (typeof tokens?.access_token !== 'string' || !tokens.access_token) return null;
+    return {
+      accessToken: tokens.access_token,
+      accountId: typeof tokens.account_id === 'string' && tokens.account_id ? tokens.account_id : undefined,
+      accountLabel: parseCodexAccountLabel(tokens.id_token),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function fetchCodexLimitsFromOAuth(): Promise<CodexOAuthFetchResult> {
+  const credentials = readCodexOAuthCredentials();
+  if (!credentials) return Promise.resolve({ limits: null, accountLabel: '', error: 'OAuth credentials unavailable' });
+
+  return new Promise(resolve => {
+    let settled = false;
+    let body = '';
+    const finish = (limits: CodexLimitsData | null, error = '') => {
+      if (settled) return;
+      settled = true;
+      resolve({ limits, accountLabel: credentials.accountLabel, error });
+    };
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${credentials.accessToken}`,
+      Accept: 'application/json',
+      'User-Agent': 'Agent-Limits-VSCode',
+    };
+    if (credentials.accountId) headers['ChatGPT-Account-Id'] = credentials.accountId;
+
+    const request = https.get('https://chatgpt.com/backend-api/wham/usage', { headers, timeout: 15_000 }, response => {
+      response.setEncoding('utf8');
+      response.on('data', chunk => {
+        body += chunk;
+        if (body.length > 1_000_000) request.destroy(new Error('response too large'));
+      });
+      response.on('end', () => {
+        if (response.statusCode !== 200) {
+          finish(null, `OAuth API HTTP ${response.statusCode || 'error'}`);
+          return;
+        }
+        const limits = parseCodexLimitsFromWhamUsage(body);
+        finish(limits, limits ? '' : 'OAuth API returned no rate windows');
+      });
+      response.on('error', () => finish(null, 'OAuth API response error'));
+    });
+    request.on('timeout', () => request.destroy(new Error('request timeout')));
+    request.on('error', () => finish(null, 'OAuth API network error'));
+  });
+}
+
+// Fallback account identity: app-server may omit it even though the auth file has an id token.
 function readCodexAccountLabel(): string {
   try {
-    const auth = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.codex', 'auth.json'), 'utf8'));
+    const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_FILE, 'utf8'));
     return parseCodexAccountLabel(auth?.tokens?.id_token);
   } catch {
     return '';
@@ -172,7 +255,7 @@ function fetchCodexLimitsFromAppServer(onAccountLabel: (label: string) => void, 
     let settled = false;
     let buffer = '';
     const child = spawn(executable, ['app-server'], {
-      env: { ...process.env, CODEX_HOME: path.join(os.homedir(), '.codex') },
+      env: { ...process.env, CODEX_HOME: CODEX_HOME_DIR },
       stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true,
     });
@@ -528,8 +611,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   function fetchCodexAndRefresh() {
-    codexDetected = Boolean(vscode.extensions.getExtension('openai.chatgpt')) ||
-      fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json'));
+    codexDetected = Boolean(vscode.extensions.getExtension('openai.chatgpt')) || fs.existsSync(CODEX_AUTH_FILE);
     fetchCodexLimits(label => {
       cachedCodexAccountLabel = label || readCodexAccountLabel();
       applyTooltips(getLang());

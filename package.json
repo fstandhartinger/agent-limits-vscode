@@ -2,7 +2,7 @@
   "name": "claude-limits",
   "displayName": "Claude, Codex & Devin Limits",
   "description": "Monitor Claude Code, Codex, and Devin usage in separate VS Code status bar indicators.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "maslovserg",
   "icon": "icon.png",
   "repository": {

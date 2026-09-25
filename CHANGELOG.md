@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1]
+- Codex now reads the account-scoped OAuth usage endpoint first, including provider reset timestamps, then falls back to the local Codex app-server and session logs.
+- Shows model-specific Codex rate windows returned by the OAuth endpoint when available.
+- The OAuth access token and account ID are read from `CODEX_HOME/auth.json` (or `~/.codex/auth.json`); this extension does not refresh or write those credentials.
+
 ## [0.4.0]
 - Added a third Devin status item using the documented Devin v3 organization-consumption endpoints.
 - Reads the local Devin API key from `~/.config/devin/api_key`; the key is sent only to `api.devin.ai` and is not stored or bundled.

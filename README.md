@@ -5,7 +5,7 @@ Monitor Claude Code, Codex, and Devin in separate VS Code status bar items. Clau
 ## Status bar
 
 - **Claude:** 5-hour session, 7-day usage, and the optional 7-day Sonnet limit.
-- **Codex:** rate-limit windows returned by the local Codex app-server, with recent session logs as a fallback.
+- **Codex:** current account-scoped OAuth rate limits first, then the local Codex app-server, with recent session logs as a display fallback. Model-specific windows are shown when the endpoint returns them.
 - **Devin:** ACUs consumed over the trailing 7 days, when the local Devin API key can read the account’s organization consumption.
 - **Refresh:** click any indicator to refresh all three.
 - **Refresh interval:** five minutes.
@@ -23,7 +23,7 @@ The extension calls `GET /v3/self` to find the organization ID, then `GET /v3/or
 
 The Claude monitor reads the signed-in token locally, fetches usage, and stores the result in `~/.claude/limits.json`. It keeps the existing Stop hook and marks old readings as stale.
 
-The Codex monitor requests rate limits from the installed Codex app-server, discovers the Codex VS Code extension’s bundled executable, and can fall back to recent local Codex session logs.
+The Codex monitor reads the OAuth access token and account ID from `CODEX_HOME/auth.json` (or `~/.codex/auth.json`) and calls `GET https://chatgpt.com/backend-api/wham/usage`. It does not refresh or write that file. If the endpoint is unavailable, it falls back to `codex app-server` using `account/read` and `account/rateLimits/read`; recent local session logs remain the display fallback.
 
 ## Settings
 
